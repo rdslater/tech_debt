@@ -1,31 +1,44 @@
 import os
-import torch
-import pydicom
+import traceback
+import cv2
 import numpy as np
 import pandas as pd
-from torchvision import transforms
-import cv2
-from ultralytics import YOLO
+import pydicom
+import torch
 from PIL import Image
-import traceback
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+from torchvision import transforms
+from ultralytics import YOLO
+
 from models import StrongModel, SwinBinaryClassifier
 
+# --- Configuration & Constants ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+OUTPUT_DIR = "./screenshotscropped"
+CROP_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "cropped")
+EXCEL_PATH = r"./data.xlsx"
 
-def get_transform():
-    """Returns Albumentations transform for flipping and rotating."""
-    return A.Compose([
-        ToTensorV2()  # Converts to PyTorch tensor
-    ])
+IMG_SIZE_YOLO = 512
+CROP_SIZE = 512
+LABEL_MAP = {0: "Left", 1: "Right"}
+
+# Model Paths
+SEGMENTATION_MODEL_PATH = "50epochs_strongmodel_augmentation_gencropping_noclahe_8020split_mitUNET.pth"
+SWIN_MODEL_PATH = "swintiny_binary_best.pth"
+YOLO_MODEL_PATH = "Yolo1.pt"
+
+# --- Image Transforms ---
+SWIN_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+TO_TENSOR = transforms.ToTensor()
 
 
-def hflip(tensor):
-    tensor = tensor.flip(2)
-    return tensor
+# --- Helper Functions ---
 
-
-def dicom_to_pil(dicom_path):
+def dicom_to_pil(dicom_path: str) -> Image.Image:
+    """Reads a DICOM file and normalizes it to an RGB PIL Image."""
     ds = pydicom.dcmread(dicom_path)
     img = ds.pixel_array.astype(np.float32)
 
@@ -46,196 +59,164 @@ def dicom_to_pil(dicom_path):
     return Image.fromarray(img)
 
 
-swin_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
+def load_models():
+    """Initializes and loads weights for all 3 models."""
+    # 1. Segmentation Model
+    seg_model = StrongModel('Unet', 'mit_b4', in_channels=3, out_classes=1, encoder_weights=None)
+    checkpoint = torch.load(SEGMENTATION_MODEL_PATH, map_location="cpu")
+    seg_model.load_state_dict(checkpoint.get('state_dict', checkpoint))
+    seg_model.to(DEVICE).eval()
 
-
-def main():
-    segmentation_model_path = "50epochs_strongmodel_augmentation_gencropping_noclahe_8020split_mitUNET.pth"
-    segmentation_model = StrongModel('Unet',
-                                     'mit_b4',
-                                     in_channels=3,
-                                     out_classes=1,
-                                     encoder_weights=None)
-
-    # Load state dictionary from checkpoint
-    checkpoint = torch.load(segmentation_model_path,  map_location="cpu")
-    segmentation_model.load_state_dict(checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint)
-    swin_model_path = "swintiny_binary_best.pth"
-    yolo_model_path = "Yolo1.pt"
-    output_dir = "./screenshotscropped"
-    img_size = 512  # this is for YOLO, it should be 512
-    crop_size = 512  # this is the size after cropping
-    EXCEL_PATH = r"./data.xlsx"
-    df = pd.read_excel(EXCEL_PATH)
-    crop_output_dir = os.path.join(output_dir, "cropped")
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(crop_output_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    label_map = {0: "Left", 1: "Right"}
-    #  Yolo will start with a confidence of 0.5, then if it doesn't detect anything, it will go down with steps of 0.1, then if it reaches 0.1 without detection
-    #  then it will go through the values in the list below
-    start_conf = 0.5
-    step = 0.1
-    special_after_0_1 = [0.1, 0.08, 0.05, 0.03, 0.01, 0.005, 0.001]
-
-    # Load Swin eye classification
-    swin_model = SwinBinaryClassifier(pretrained=False).to(device)
-    checkpoint = torch.load(swin_model_path, map_location=device)
-    swin_model.load_state_dict(checkpoint['model_state_dict'])
+    # 2. Swin Classifier
+    swin_model = SwinBinaryClassifier(pretrained=False).to(DEVICE)
+    swin_checkpoint = torch.load(SWIN_MODEL_PATH, map_location=DEVICE)
+    swin_model.load_state_dict(swin_checkpoint['model_state_dict'])
     swin_model.eval()
 
-    # Init YOLO
-    yolo_model = YOLO(yolo_model_path)
+    # 3. YOLO Object Detector
+    yolo_model = YOLO(YOLO_MODEL_PATH)
 
-    # design the pipeline, first classify the eye, then customize the cropping
-    for idx, dicom_path in enumerate(df["File Path"], start=1):
-        dicom_path = str(dicom_path).strip()
-        base_name = os.path.splitext(os.path.basename(dicom_path))[0]
-        print(f"\n[{idx}/{len(df)}] Processing {base_name}")
-        if not os.path.exists(dicom_path):
-            print("File missing")
-            continue
+    return seg_model, swin_model, yolo_model
+
+
+def predict_eye_side(img: Image.Image, model) -> str:
+    """Classifies whether the image is a Left or Right eye."""
+    input_tensor = SWIN_TRANSFORM(img).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        output = model(input_tensor)
+        prob = torch.sigmoid(output).item()
+    pred_class = int(prob > 0.5)
+    return LABEL_MAP[pred_class]
+
+
+def run_yolo_dynamic_conf(img: Image.Image, model) -> tuple:
+    """Runs YOLO inference dropping confidence iteratively until a box is found."""
+    # Strategy 1: Decay from 0.5 down to 0.1
+    confidences = list(np.arange(0.5, 0.1, -0.1))
+    # Strategy 2: Fine-grained fallback thresholds
+    confidences += [0.1, 0.08, 0.05, 0.03, 0.01, 0.005, 0.001]
+
+    for conf in confidences:
+        conf = round(float(conf), 6)
         try:
-            img = dicom_to_pil(dicom_path)
-        except Exception as e:
-            print(f"DICOM read failed: {e}")
-            continue
-        # 1)is it left or right eye?
-        input_tensor = swin_transform(img).unsqueeze(0).to(device)
-        with torch.no_grad():
-            output = swin_model(input_tensor)
-            prob = torch.sigmoid(output).item()
-            pred_class = int(prob > 0.5)
-            eye_label = label_map[pred_class]
-        print(f"\n{base_name}: {eye_label} Eye (prob={prob:.3f})")
-        # 2)detect the disc
-        found_results = None
-        conf = start_conf
-
-        while conf > 0.1:
-            try:
-                results = yolo_model.predict(source=img,
-                                             imgsz=img_size,
-                                             device=device,
-                                             conf=conf,
-                                             verbose=False)
-            except Exception as e:
-                print(f"Predict error at conf={conf} for {base_name}: {e}")
-                traceback.print_exc()
-                break
-
+            results = model.predict(source=img, imgsz=IMG_SIZE_YOLO, device=DEVICE, conf=conf, verbose=False)
             boxes = getattr(results[0], "boxes", None)
-            num = len(boxes) if boxes is not None else 0
-            if num > 0:
-                found_results = (results, conf)
-                break
-            conf = round(conf - step, 6)
+            if boxes is not None and len(boxes) > 0:
+                return results, conf
+        except Exception as e:
+            print(f"YOLO predict error at conf={conf}: {e}")
+    return None, None
 
-        if found_results is None:
-            for conf in special_after_0_1:
-                try:
-                    results = yolo_model.predict(source=img,
-                                                 imgsz=img_size,
-                                                 device=device,
-                                                 conf=conf,
-                                                 verbose=False)
-                except Exception as e:
-                    print(f"Predict error at conf={conf} for {base_name}: {e}")
-                    traceback.print_exc()
-                    continue
-                boxes = getattr(results[0], "boxes", None)
-                num = len(boxes) if boxes is not None else 0
-                if num > 0:
-                    found_results = (results, conf)
-                    break
 
-        if found_results is None:
-            results = None
-            print(f"No YOLO detections for {base_name}")
+def calculate_crop_bounds(cx: int, cy: int, eye_label: str, img_shape: tuple) -> tuple:
+    """Calculates directional crop bounding box around optic disc center."""
+    h, w, _ = img_shape
+    cx_offset = cx + 50 if eye_label == "Left" else cx - 50
+
+    x1 = max(0, cx_offset - CROP_SIZE // 2)
+    y1 = max(0, cy - CROP_SIZE // 2)
+    x2 = x1 + CROP_SIZE
+    y2 = y1 + CROP_SIZE
+
+    # Out of bounds corrections
+    if x2 > w:
+        x1, x2 = w - CROP_SIZE, w
+    if y2 > h:
+        y1, y2 = h - CROP_SIZE, h
+
+    return int(x1), int(y1), int(x2), int(y2)
+
+
+def process_segmentation(cropped_img_np: np.ndarray, seg_model) -> np.ndarray:
+    """Generates a binary segmentation mask from a cropped image snippet."""
+    cropped_pil = Image.fromarray(cropped_img_np)
+    input_seg = TO_TENSOR(cropped_pil).unsqueeze(0).to(DEVICE)
+    
+    with torch.no_grad():
+        mask_logit = seg_model(input_seg)
+        mask_prob = torch.sigmoid(mask_logit)
+        mask_pred = (mask_prob > 0.5).cpu().numpy()[0, 0]
+        
+    mask_overlay = np.zeros((CROP_SIZE, CROP_SIZE), dtype=np.uint8)
+    mask_overlay[mask_pred > 0] = 255
+    return mask_overlay
+
+
+def save_overlay_result(cropped_bgr: np.ndarray, mask: np.ndarray, save_path: str):
+    """Blends a red mask over the BGR cropped image and saves it to disk."""
+    colored_mask = np.zeros_like(cropped_bgr, dtype=np.uint8)
+    colored_mask[mask > 0] = (0, 0, 255)  # Red mask in BGR
+    blended = cv2.addWeighted(cropped_bgr, 0.7, colored_mask, 0.3, 0)
+    cv2.imwrite(save_path, blended)
+
+
+# --- Main Pipeline ---
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(CROP_OUTPUT_DIR, exist_ok=True)
+
+    print("Loading deep learning frameworks...")
+    seg_model, swin_model, yolo_model = load_models()
+    
+    df = pd.read_excel(EXCEL_PATH)
+    total_files = len(df)
+
+    for idx, raw_path in enumerate(df["File Path"], start=1):
+        dicom_path = str(raw_path).strip()
+        base_name = os.path.splitext(os.path.basename(dicom_path))[0]
+        print(f"\n[{idx}/{total_files}] Processing {base_name}")
+
+        if not os.path.exists(dicom_path):
+            print("→ File missing. Skipping.")
             continue
 
-        results, final_conf = found_results
-        print(f"YOLO detected {len(results[0].boxes)} boxes at conf={final_conf} for {base_name}")
-
-        # 3)save the cropped version
-        save_path = os.path.join(output_dir, f"{base_name}_pred.jpg")
         try:
-            results[0].save(filename=save_path)
+            # 1. Load DICOM
+            img = dicom_to_pil(dicom_path)
+            img_np = np.array(img)
 
+            # 2. Eye Classification (Swin)
+            eye_label = predict_eye_side(img, swin_model)
+            print(f"→ Classification: {eye_label} Eye")
+
+            # 3. Target Detection (YOLO)
+            results, final_conf = run_yolo_dynamic_conf(img, yolo_model)
+            if not results:
+                print(f"→ No YOLO detections for {base_name}")
+                continue
+            
+            # Save raw YOLO prediction screenshot
+            results[0].save(filename=os.path.join(OUTPUT_DIR, f"{base_name}_pred.jpg"))
+            
+            # Extract highest-scoring detection box
             boxes = results[0].boxes.xyxy.cpu().numpy()
             scores = results[0].boxes.conf.cpu().numpy()
-
             if len(boxes) == 0:
-                print(f"No boxes to crop for {base_name}")
+                print("→ Found empty bounding boxes. Skipping crop.")
                 continue
 
-            # keep the detection with highest confidence:
-            # This is because each eye will only have 1 disc
             best_idx = np.argmax(scores)
             x1, y1, x2, y2 = boxes[best_idx]
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
+            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
 
-            img_np = np.array(img)
-            h, w, _ = img_np.shape
+            # 4. Contextual Crop Extraction
+            x1_c, y1_c, x2_c, y2_c = calculate_crop_bounds(cx, cy, eye_label, img_np.shape)
+            cropped_rgb = img_np[y1_c:y2_c, x1_c:x2_c]
 
-            # Offset by xpixels  left or right of the disc center
-            if eye_label == "Left":
-                cx_offset = cx + 50  # -30
-            else:  # Right eye
-                cx_offset = cx - 50  # +30
+            # 5. Semantic Segmentation Model
+            mask_overlay = process_segmentation(cropped_rgb, seg_model)
 
-            # Calculate crop bounds
-            x1_crop = max(0, cx_offset - crop_size // 2)
-            y1_crop = max(0, cy - crop_size // 2)
-            x2_crop = x1_crop + crop_size
-            y2_crop = y1_crop + crop_size
-
-            # in case it's out of bound
-            if x2_crop > w:
-                x1_crop = w - crop_size
-                x2_crop = w
-            if y2_crop > h:
-                y1_crop = h - crop_size
-                y2_crop = h
-
-            cropped = img_np[int(y1_crop):int(y2_crop),
-                             int(x1_crop):int(x2_crop)]
-            cropped_img = Image.fromarray(cropped)
-            from torchvision import transforms
-            to_tensornew = transforms.ToTensor()
-            input_segmentation = to_tensornew(cropped_img).unsqueeze(0).to(device)
-            with torch.no_grad():
-                mask_logit = segmentation_model(input_segmentation)
-                mask_probability = torch.sigmoid(mask_logit)
-                mask_prediction = (mask_probability > 0.5).cpu().numpy()[0, 0]
-                # print(mask_prediction.shape)
-            mask_overlay = np.zeros((512, 512))
-            mask_overlay[np.array(mask_prediction) > 0] = 255
-            mask_save_path = os.path.join(crop_output_dir, f"{base_name}_{eye_label}_mask.png")
-            mask_overlay = ((mask_overlay > 0) * 255).astype(np.uint8)
-            img_np = np.array(img)                 # RGB uint8
-            img_cv = cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR)
-            colored_mask = np.zeros_like(img_cv, dtype=np.uint8)
-            print(img_cv.shape)
-            print(mask_overlay.shape)
-            colored_mask[mask_overlay > 0] = (0, 0, 255)
-            to_ret = cv2.addWeighted(img_cv, 1 - 0.3, colored_mask, 0.3, 0)
-            # Save overlay image
-            cv2.imwrite(mask_save_path, to_ret)
+            # 6. Save Blended Result
+            cropped_bgr = cv2.cvtColor(cropped_rgb, cv2.COLOR_RGB2BGR)
+            mask_save_path = os.path.join(CROP_OUTPUT_DIR, f"{base_name}_{eye_label}_mask.png")
+            save_overlay_result(cropped_bgr, mask_overlay, mask_save_path)
 
         except Exception as e:
             print(f"Failed to process {base_name}: {e}")
             traceback.print_exc()
 
-        print("\nAll predictions + 512×512 directional crops completed.")
+    print("\nAll predictions + directional crops completed successfully.")
     return 0
 
 
