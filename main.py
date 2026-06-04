@@ -8,7 +8,6 @@ import torch
 from PIL import Image
 from torchvision import transforms
 from ultralytics import YOLO
-
 from models import StrongModel, SwinBinaryClassifier
 
 # --- Configuration & Constants ---
