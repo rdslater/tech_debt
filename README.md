@@ -15,3 +15,5 @@ main.py right now accepts and excel file and saves a jpg.  We need a dicom outpu
 
 Every time this model runs, we load up the model--creates overhead.  For now is acceptable.  Will not scale (Model Serving or Triton required).  This is only proof of concept so higher priority is formating.
 
+Ivan Drago says about bout print statements "I must break them"  (aka USE LOGGING PEOPLE!)
+
