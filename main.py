@@ -30,7 +30,8 @@ YOLO_MODEL_PATH = "Yolo1.pt"
 SWIN_TRANSFORM = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
 ])
 TO_TENSOR = transforms.ToTensor()
 
@@ -62,7 +63,8 @@ def dicom_to_pil(dicom_path: str) -> Image.Image:
 def load_models():
     """Initializes and loads weights for all 3 models."""
     # 1. Segmentation Model
-    seg_model = StrongModel('Unet', 'mit_b4', in_channels=3, out_classes=1, encoder_weights=None)
+    seg_model = StrongModel('Unet', 'mit_b4', in_channels=3,
+                            out_classes=1, encoder_weights=None)
     checkpoint = torch.load(SEGMENTATION_MODEL_PATH, map_location="cpu")
     seg_model.load_state_dict(checkpoint.get('state_dict', checkpoint))
     seg_model.to(DEVICE).eval()
@@ -90,7 +92,10 @@ def predict_eye_side(img: Image.Image, model) -> str:
 
 
 def run_yolo_dynamic_conf(img: Image.Image, model) -> tuple:
-    """Runs YOLO inference dropping confidence iteratively until a box is found."""
+    """
+    Runs YOLO inference dropping confidence
+    iteratively until a box is found.
+    """
     # Strategy 1: Decay from 0.5 down to 0.1
     confidences = list(np.arange(0.5, 0.1, -0.1))
     # Strategy 2: Fine-grained fallback thresholds
@@ -99,7 +104,8 @@ def run_yolo_dynamic_conf(img: Image.Image, model) -> tuple:
     for conf in confidences:
         conf = round(float(conf), 6)
         try:
-            results = model.predict(source=img, imgsz=IMG_SIZE_YOLO, device=DEVICE, conf=conf, verbose=False)
+            results = model.predict(source=img, imgsz=IMG_SIZE_YOLO,
+                                    device=DEVICE, conf=conf, verbose=False)
             boxes = getattr(results[0], "boxes", None)
             if boxes is not None and len(boxes) > 0:
                 return results, conf
@@ -108,7 +114,8 @@ def run_yolo_dynamic_conf(img: Image.Image, model) -> tuple:
     return None, None
 
 
-def calculate_crop_bounds(cx: int, cy: int, eye_label: str, img_shape: tuple) -> tuple:
+def calculate_crop_bounds(cx: int, cy: int,
+                          eye_label: str, img_shape: tuple) -> tuple:
     """Calculates directional crop bounding box around optic disc center."""
     h, w, _ = img_shape
     cx_offset = cx + 50 if eye_label == "Left" else cx - 50
@@ -131,18 +138,19 @@ def process_segmentation(cropped_img_np: np.ndarray, seg_model) -> np.ndarray:
     """Generates a binary segmentation mask from a cropped image snippet."""
     cropped_pil = Image.fromarray(cropped_img_np)
     input_seg = TO_TENSOR(cropped_pil).unsqueeze(0).to(DEVICE)
-    
+
     with torch.no_grad():
         mask_logit = seg_model(input_seg)
         mask_prob = torch.sigmoid(mask_logit)
         mask_pred = (mask_prob > 0.5).cpu().numpy()[0, 0]
-        
+
     mask_overlay = np.zeros((CROP_SIZE, CROP_SIZE), dtype=np.uint8)
     mask_overlay[mask_pred > 0] = 255
     return mask_overlay
 
 
-def save_overlay_result(cropped_bgr: np.ndarray, mask: np.ndarray, save_path: str):
+def save_overlay_result(cropped_bgr: np.ndarray,
+                        mask: np.ndarray, save_path: str):
     """Blends a red mask over the BGR cropped image and saves it to disk."""
     colored_mask = np.zeros_like(cropped_bgr, dtype=np.uint8)
     colored_mask[mask > 0] = (0, 0, 255)  # Red mask in BGR
@@ -158,7 +166,7 @@ def main():
 
     print("Loading deep learning frameworks...")
     seg_model, swin_model, yolo_model = load_models()
-    
+
     df = pd.read_excel(EXCEL_PATH)
     total_files = len(df)
 
@@ -185,10 +193,11 @@ def main():
             if not results:
                 print(f"→ No YOLO detections for {base_name}")
                 continue
-            
+
             # Save raw YOLO prediction screenshot
-            results[0].save(filename=os.path.join(OUTPUT_DIR, f"{base_name}_pred.jpg"))
-            
+            results[0].save(filename=os.path.join(OUTPUT_DIR,
+                                                  f"{base_name}_pred.jpg"))
+
             # Extract highest-scoring detection box
             boxes = results[0].boxes.xyxy.cpu().numpy()
             scores = results[0].boxes.conf.cpu().numpy()
@@ -201,7 +210,9 @@ def main():
             cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
 
             # 4. Contextual Crop Extraction
-            x1_c, y1_c, x2_c, y2_c = calculate_crop_bounds(cx, cy, eye_label, img_np.shape)
+            x1_c, y1_c, x2_c, y2_c = calculate_crop_bounds(cx, cy,
+                                                           eye_label,
+                                                           img_np.shape)
             cropped_rgb = img_np[y1_c:y2_c, x1_c:x2_c]
 
             # 5. Semantic Segmentation Model
@@ -209,7 +220,8 @@ def main():
 
             # 6. Save Blended Result
             cropped_bgr = cv2.cvtColor(cropped_rgb, cv2.COLOR_RGB2BGR)
-            mask_save_path = os.path.join(CROP_OUTPUT_DIR, f"{base_name}_{eye_label}_mask.png")
+            mask_save_path = os.path.join(CROP_OUTPUT_DIR, 
+                                          f"{base_name}_{eye_label}_mask.png")
             save_overlay_result(cropped_bgr, mask_overlay, mask_save_path)
 
         except Exception as e:
